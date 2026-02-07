@@ -1,0 +1,315 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "CloudFormation template for Click-Stream ETL Iceberg Pipeline"
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: "demo"
+    Description: "Environment name"
+
+  ExistingS3BucketName:
+    Type: String
+    Default: "iceberg-data-lake-prep-demo"
+    Description: "Existing S3 bucket name for Iceberg data lake"
+
+  LambdaScriptS3Path:
+    Type: String
+    Default: "scripts/lambda/click-stream-producer-lambda.zip"
+    Description: "S3 path to Lambda function code (zip file)"
+
+  GlueScriptS3Path:
+    Type: String
+    Default: "scripts/glue/glue_kinesis_to_iceberg.py"
+    Description: "S3 path to Glue job script"
+
+Resources:
+  # ===================================
+  # 1. IAM ROLES
+  # ===================================
+
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: click-stream-etl-iceberg-lambda-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: KinesisLambdaPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:PutRecord
+                  - kinesis:PutRecords
+                Resource: !GetAtt KinesisStream.Arn
+      Tags:
+        - Key: project
+          Value: iceberg-demo
+
+  # Glue Job Execution Role
+  GlueExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: click-stream-etl-iceberg-glue-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: GlueS3Access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:*
+                Resource:
+                  - !Sub "arn:aws:s3:::${ExistingS3BucketName}"
+                  - !Sub "arn:aws:s3:::${ExistingS3BucketName}/*"
+        - PolicyName: GlueKinesisAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:*
+                Resource: !GetAtt KinesisStream.Arn
+        - PolicyName: GlueCloudWatchAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:*
+                  - cloudwatch:*
+                Resource: "*"
+        - PolicyName: GlueCatalogAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:*
+                Resource: "*"
+      Tags:
+        - Key: project
+          Value: iceberg-demo
+
+  # ===================================
+  # 3. KINESIS DATA STREAM
+  # ===================================
+
+  KinesisStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: kinesis-click-real-data
+      StreamModeDetails:
+        StreamMode: PROVISIONED
+      ShardCount: 2
+      Tags:
+        - Key: project
+          Value: iceberg-demo
+
+  # ===================================
+  # 4. LAMBDA FUNCTION
+  # ===================================
+
+  ClickStreamProducerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: click-stream-producer-lambda
+      Runtime: python3.11
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Handler: lambda_function.lambda_handler
+      Environment:
+        Variables:
+          KINESIS_STREAM_NAME: !Ref KinesisStream
+      Code:
+        S3Bucket: !Ref ExistingS3BucketName
+        S3Key: !Ref LambdaScriptS3Path
+      Tags:
+        - Key: project
+          Value: iceberg-demo
+
+  # ===================================
+  # 5. AWS GLUE DATABASE (SCHEMA)
+  # ===================================
+
+  IcebergGlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: iceberg-click-stream
+        Description: "Glue database for Iceberg clickstream tables"
+
+  # ===================================
+  # 6. AWS GLUE STREAMING JOB
+  # ===================================
+
+  ClickStreamGlueJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: click-stream-etl-iceberg-job
+      Description: "Glue Streaming Job for Kinesis to Iceberg ETL"
+      Role: !GetAtt GlueExecutionRole.Arn
+      Command:
+        Name: gluestreaming
+        ScriptLocation: !Sub "s3://${ExistingS3BucketName}/${GlueScriptS3Path}"
+        PythonVersion: "3.9"
+      DefaultArguments:
+        "--enable-spark-ui": "true"
+        "--spark-event-logs-path": !Sub "s3://${ExistingS3BucketName}/spark-logs/"
+        "--enable-job-insights": "true"
+        "--enable-glue-datacatalog": "true"
+        "--TempDir": !Sub "s3://${ExistingS3BucketName}/temp/"
+        "--job-bookmark-option": "job-bookmark-disable"
+        "--KINESIS_STREAM_NAME": !Ref KinesisStream
+        "--DATABASE_NAME": !Ref IcebergGlueDatabase
+        "--S3_OUTPUT_PATH": !Sub "s3://${ExistingS3BucketName}/data/"
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      MaxRetries: 0
+      Timeout: 2880
+      GlueVersion: "4.0"
+      Tags:
+        project: iceberg-demo
+    DependsOn:
+      - IcebergGlueDatabase
+
+  # ===================================
+  # 7. ATHENA WORKGROUP
+  # ===================================
+
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: iceberg-wg
+      Description: "Athena workgroup for Iceberg clickstream analytics"
+      State: ENABLED
+      RecursiveDeleteOption: true
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${ExistingS3BucketName}/athena-results/"
+        EngineVersion:
+          SelectedEngineVersion: "AUTO"
+      Tags:
+        - Key: project
+          Value: iceberg-demo
+
+  # ===================================
+  # 8. CLOUDWATCH LOG GROUPS
+  # ===================================
+
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: "/aws/lambda/click-stream-producer-lambda"
+      RetentionInDays: 14
+      Tags:
+        - Key: project
+          Value: iceberg-demo
+
+  GlueLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: "/aws/glue/click-stream-etl-iceberg-job"
+      RetentionInDays: 30
+      Tags:
+        - Key: project
+          Value: iceberg-demo
+
+Outputs:
+  S3BucketName:
+    Description: "S3 bucket for Iceberg data lake"
+    Value: !Ref ExistingS3BucketName
+    Export:
+      Name: !Sub "${AWS::StackName}-S3Bucket"
+
+  KinesisStreamName:
+    Description: "Kinesis stream for clickstream events"
+    Value: !Ref KinesisStream
+    Export:
+      Name: !Sub "${AWS::StackName}-KinesisStream"
+
+  KinesisStreamArn:
+    Description: "Kinesis stream ARN"
+    Value: !GetAtt KinesisStream.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-KinesisStreamArn"
+
+  LambdaFunctionName:
+    Description: "Lambda function for clickstream producer"
+    Value: !Ref ClickStreamProducerLambda
+    Export:
+      Name: !Sub "${AWS::StackName}-LambdaFunction"
+
+  LambdaFunctionArn:
+    Description: "Lambda function ARN"
+    Value: !GetAtt ClickStreamProducerLambda.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-LambdaFunctionArn"
+
+  LambdaRoleArn:
+    Description: "Lambda execution role ARN"
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-LambdaRole"
+
+  GlueJobName:
+    Description: "Glue job name for Iceberg ETL"
+    Value: !Ref ClickStreamGlueJob
+    Export:
+      Name: !Sub "${AWS::StackName}-GlueJob"
+
+  GlueRoleArn:
+    Description: "Glue execution role ARN"
+    Value: !GetAtt GlueExecutionRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-GlueRole"
+
+  GlueDatabaseName:
+    Description: "Glue database name for Iceberg tables"
+    Value: !Ref IcebergGlueDatabase
+    Export:
+      Name: !Sub "${AWS::StackName}-GlueDatabase"
+
+  AthenaWorkGroupName:
+    Description: "Athena workgroup name"
+    Value: !Ref AthenaWorkGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-AthenaWorkGroup"
+
+  AthenaResultLocation:
+    Description: "S3 location for Athena query results"
+    Value: !Sub "s3://${ExistingS3BucketName}/athena-results/"
+    Export:
+      Name: !Sub "${AWS::StackName}-AthenaResults"
+
+  DataLakePath:
+    Description: "S3 path for Iceberg data lake"
+    Value: !Sub "s3://${ExistingS3BucketName}/data/"
+    Export:
+      Name: !Sub "${AWS::StackName}-DataLakePath"
+
+  ScriptsPath:
+    Description: "S3 path for Lambda and Glue scripts"
+    Value: !Sub "s3://${ExistingS3BucketName}/scripts/"
+    Export:
+      Name: !Sub "${AWS::StackName}-ScriptsPath"
