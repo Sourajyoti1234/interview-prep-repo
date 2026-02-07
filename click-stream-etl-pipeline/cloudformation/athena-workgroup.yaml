@@ -1,0 +1,31 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Athena WorkGroup for Iceberg analytics
+
+Resources:
+  AthenaWorkGroupIceberg:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: interview-prep-wg
+      Description: Athena workgroup for Interview Prep
+      State: ENABLED
+      RecursiveDeleteOption: true
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        ResultConfiguration:
+          OutputLocation: s3://interview-prep-bucket/click-stream-etl-pipeline/athena_results/ 
+        EngineVersion:
+          SelectedEngineVersion: Athena engine version 3
+      Tags:
+        - Key: project-name
+          Value: click-stream-etl-pipeline
+
+
+Outputs:
+  AthenaWorkGroupName:
+    Description: Athena Iceberg WorkGroup Name
+    Value: iceberg-workgroup
+
+  AthenaResultLocation:
+    Description: S3 location for Athena query results
+    Value: s3://interview-prep-bucket/click-stream-etl-pipeline/athena_results/
